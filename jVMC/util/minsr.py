@@ -5,6 +5,9 @@ import jVMC.mpi_wrapper as mpi
 import jVMC.global_defs as global_defs
 from jVMC.stats import SampledObs
 
+from functools import partial
+from jax.sharding import PartitionSpec as P
+
 def realFun(x):
     return jnp.real(x)
 
@@ -50,33 +53,30 @@ class MinSR:
 
         return jnp.real(self.ElocMean0)
 
-    def solve(self, eloc, gradients, holomorphic):
+    def solve(self, eloc, gradients):
         """
         Uses the techique proposed in arXiv:2302.01941 to compute the updates.
         Efficient only if number of samples :math:`\\ll` number of parameters.
         """
 
-        if holomorphic:
-            T = gradients.tangent_kernel()
-            T_inv = jnp.linalg.pinv(T, rtol=self.pinvTol, hermitian=True)
+        if self.holomorphic or self.real:
 
-            eloc_all = mpi.gather(eloc._data).reshape((-1,))
-            gradients_all = mpi.gather(gradients._data)
-            update = - gradients_all.conj().T @ T_inv @ eloc_all
+            gradients_data = global_defs.to_named_sharding(gradients._data) # (Ns,Np)
+            eloc_data = global_defs.to_named_sharding(eloc._data).reshape(-1) # (Ns,)
+            
+            update = _solve(gradients_data, eloc_data, self.diagonalShift, self.pinvTol, self.missingSize)
 
         else:
-            gradients_all = mpi.gather(gradients._data)
-            gradients_all = jnp.concatenate([jnp.real(gradients_all), jnp.imag(gradients_all)], axis=0)
 
-            T = gradients_all @ gradients_all.T
-            T += self.diagonalShift * jnp.eye(T.shape[-1])
-            T_inv = jnp.linalg.pinv(T, rcond=self.pinvTol, hermitian=True) # in newer versions of jax, rtol is prefered over rcond
+            gradients_data = global_defs.to_named_sharding(gradients._data) # (Ns,Np)
+            eloc_data = global_defs.to_named_sharding(eloc._data).reshape(-1) # (Ns,)
+            gradients_data = jnp.concatenate([jnp.real(gradients_data), jnp.imag(gradients_data)], axis=0)
+            eloc_data = jnp.concatenate([jnp.real(eloc_data), jnp.imag(eloc_data)], axis=0)
 
-            eloc_all = mpi.gather(eloc._data).reshape((-1,))
-            eloc_all = jnp.concatenate([jnp.real(eloc_all), jnp.imag(eloc_all)], axis=0)
-
-            update = - gradients_all.T @ T_inv @ eloc_all
-
+            update = _solve(gradients_data, eloc_data, self.diagonalShift, self.pinvTol, self.missingSize)
+        
+        update = (update[:-self.missingSize] if self.missingSize > 0 else update)
+        update = jnp.array(jax.experimental.multihost_utils.process_allgather(update)).reshape(-1)
         return update
 
     def __call__(self, netParameters, t, *, psi, hamiltonian, **rhsArgs):
@@ -105,6 +105,13 @@ class MinSR:
         Returns:
             The solution of the MinSR equation, :math:`\\dot\\theta=\\bar O^\\dagger (\\bar O\\bar O^\\dagger)^{-1}\\bar E_{loc}`.
         """
+
+        def missing_size(a, b):
+            return (b - a % b) % b
+
+        self.real = psi.realParams
+        self.holomorphic = psi.holomorphic
+        self.missingSize = missing_size(len(netParameters), global_defs.myDeviceCountAll)
 
         tmpParameters = psi.get_parameters()
         psi.set_parameters(netParameters)
@@ -146,7 +153,7 @@ class MinSR:
         sampleGradients = SampledObs( sampleGradients, p)
 
         start_timing(outp, "solve MinSR eqn.")
-        update = self.solve(Eloc, sampleGradients, holomorphic=psi.holomorphic)
+        update = self.solve(Eloc, sampleGradients)
         stop_timing(outp, "solve MinSR eqn.")
 
         if outp is not None:
@@ -163,3 +170,17 @@ class MinSR:
                 self.metaData = {}
 
         return update
+
+
+@partial(jax.jit, static_argnames=["padding"])
+@partial(global_defs.shardmap_for_my_devices, in_specs=(P('i'), None, None, None, None), out_specs=P('i'))
+def _solve(gradients, eloc, diagonalShift, pinvTol, padding):
+    gr = jnp.concatenate([gradients, jnp.zeros((gradients.shape[0], padding))], axis=1)
+    gr = jax.lax.all_to_all(gr, 'i', split_axis=1, concat_axis=0, tiled=True)
+    y = gr @ jnp.conj(jnp.transpose(gr)) # (Ns,Ns)
+    y = jax.lax.psum(y, 'i')
+    y = y + diagonalShift * jnp.eye(y.shape[-1])
+    y = jnp.linalg.pinv(y, rtol=pinvTol, hermitian=True)
+    y = y @ eloc # (Ns,)
+    y = -1 * jnp.conj(jnp.transpose(gr)) @ y # (Np,)
+    return y
